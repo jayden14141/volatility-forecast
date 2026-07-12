@@ -1,4 +1,24 @@
+"""
+uncertainty quantification for the HAR volatility forecaster.
+
+All interval methods here wrap the SAME single-deployed HAR as Stage 06:
+OLS fit once on the first 1008 rows, then forward-predicted with NO retraining.
+Sharing one frozen model is what lets the 06 drift z-score and the 07 coverage
+gap be read on the same x/y axes (the "money plot").
+
+Four interval families, in order of adaptivity:
+  1. split_conformal_coverage       — constant-width, distribution-free.
+  2. normalized_conformal_coverage  — width breathes with local sigma.
+  3. aci_stream_coverage            — online alpha_t update (Gibbs-Candes 2021).
+  4. bayes_nig_fit / _predict_interval — parametric Student-t (frozen contrast).
+
+Thesis: under concept drift, exchangeability breaks and the frozen/constant-width
+methods (split, Bayesian) leak below nominal; only the online method (ACI) recovers
+long-run coverage.
+"""
+
 import numpy as np
+from scipy import stats
 
 
 def frozen_har_residuals(X, y, n_train=1008):
@@ -7,7 +27,8 @@ def frozen_har_residuals(X, y, n_train=1008):
 
     Fit OLS ONCE on the first n_train rows (the '2011-15 frozen mapping'),
     then forward-predict the entire series with NO retraining. The residual
-    stream therefore inherits the same drift that Stage 06 measured.
+    stream therefore inherits the same drift that Stage 06 measured, so 06 and
+    07 describe one identical model.
 
     Parameters
     ----------
@@ -163,22 +184,31 @@ def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
     }
     return fold_cov, np.array(alpha_path)
 
-# ── Bayesian conjugate linear regression for HAR prediction intervals ──
-# Normal-Inverse-Gamma conjugate prior -> analytic Student-t posterior predictive.
-# NO MCMC. Fit ONCE on the first `n_cal` rows (same frozen information set as 06/07),
-# then produce prediction intervals fold-by-fold without refitting.
-
-import numpy as np
-from scipy import stats
-
 
 def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
-    """Fit Normal-Inverse-Gamma posterior on calibration data (frozen once).
+    """
+    Fit a Normal-Inverse-Gamma posterior on calibration data (frozen once).
 
-    Prior: beta | sigma^2 ~ N(0, sigma^2 * (tau*I)^-1),  sigma^2 ~ Inv-Gamma(a0, b0).
-    Weakly-informative: tau small -> prior barely shrinks (posterior ~ OLS).
+    Conjugate to a Gaussian likelihood, so the posterior is analytic (NO MCMC).
+    Prior: beta | sigma^2 ~ N(0, sigma^2 (tau*I)^-1),  sigma^2 ~ Inv-Gamma(a0, b0).
+    Weakly-informative tau -> prior barely shrinks (posterior mean ~ OLS beta).
+    NOTE on scale: for tiny RV-scale targets, keep a0, b0 small (e.g. 1e-3, 1e-6),
+    else the prior dominates b_n/a_n and the intervals blow up to ~100% coverage.
 
-    Returns dict of posterior params consumed by bayes_predict_interval.
+    Parameters
+    ----------
+    X_cal : np.ndarray, shape (n, d)   design matrix INCLUDING an intercept column.
+    y_cal : np.ndarray, shape (n,)     calibration target.
+    tau : float                        prior precision scale (small = weak prior).
+    a0, b0 : float                     Inv-Gamma prior shape / scale.
+
+    Returns
+    -------
+    post : dict with
+        mu_n : (d,)   posterior mean of beta (ridge point estimate).
+        Lambda_n_inv : (d, d)  posterior precision inverse (epistemic scaffold).
+        a_n : float   posterior Inv-Gamma shape (predictive dof = 2*a_n).
+        b_n : float   posterior Inv-Gamma scale (aleatoric var = b_n/a_n).
     """
     X_cal = np.asarray(X_cal, float)
     y_cal = np.asarray(y_cal, float)
@@ -197,22 +227,34 @@ def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
     )
 
     return {
-        "mu_n": mu_n,               # posterior mean of beta        (d,)
-        "Lambda_n_inv": Lambda_n_inv,  # posterior cov scaffold      (d, d)
-        "a_n": a_n,                 # Inv-Gamma shape  -> dof = 2*a_n
-        "b_n": b_n,                 # Inv-Gamma scale
+        "mu_n": mu_n,
+        "Lambda_n_inv": Lambda_n_inv,
+        "a_n": a_n,
+        "b_n": b_n,
     }
 
 
 def bayes_predict_interval(post, X_new, alpha=0.1):
-    """Student-t posterior predictive interval for each row of X_new.
+    """
+    Student-t posterior predictive interval for each row of X_new.
 
     Predictive: y* ~ t_nu( mean = x*'mu_n,
                            scale^2 = (b_n/a_n) * (1 + x*' Lambda_n_inv x*) ),
                 nu = 2*a_n.
-    scale^2 splits into aleatoric (b_n/a_n) + epistemic (x*' Lambda_n_inv x*) parts.
+    scale^2 decomposes uncertainty into
+        aleatoric  = b_n / a_n                (frozen observation noise), and
+        epistemic  = x*' Lambda_n_inv x*      (parameter uncertainty; grows as
+                                               x* leaves the calibration region).
 
-    Returns (lower, upper, y_hat) each shape (len(X_new),).
+    Parameters
+    ----------
+    post : dict     output of bayes_nig_fit.
+    X_new : np.ndarray, shape (m, d)   query design matrix (same intercept layout).
+    alpha : float   target miscoverage (nominal coverage = 1-alpha).
+
+    Returns
+    -------
+    lower, upper, y_hat : np.ndarray, each shape (m,).
     """
     X_new = np.asarray(X_new, float)
     mu_n = post["mu_n"]
