@@ -1,7 +1,7 @@
 """Uncertainty quantification for the HAR volatility forecaster (stage 07).
 
 All interval methods here wrap the SAME model as stage 06: a static HAR
-fit once by OLS on the first 1008 rows and then used with no retraining.
+fit once by OLS on the first 987 rows and then used with no retraining.
 Sharing one static model is what makes the stage-06 drift z-scores and
 the stage-07 coverage gaps directly comparable per fold.
 
@@ -24,7 +24,7 @@ import numpy as np
 from scipy import stats
 
 
-def static_har_residuals(X, y, n_train=1008):
+def static_har_residuals(X, y, n_train=987):
     """Reproduce stage 06's static HAR and return its residual stream.
 
     Fit OLS once on the first n_train rows, then forward-predict the
@@ -36,7 +36,7 @@ def static_har_residuals(X, y, n_train=1008):
     ----------
     X : np.ndarray, shape (T, p)   HAR features (rv1, rv5, rv21), no intercept column.
     y : np.ndarray, shape (T,)     target (future h-day RV).
-    n_train : int                  training window (default 1008 = f00 test start).
+    n_train : int                  training window (default 987 = 1008 - 21 embargo: last train label matures before OOS).
 
     Returns
     -------
@@ -135,7 +135,7 @@ def normalized_conformal_coverage(resid_cal, sigma_cal,
     return coverage, q, mean_width
 
 
-def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
+def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252, delay=21,
                         alpha=0.1, gamma=0.01, a_lo=1e-3, a_hi=1-1e-3):
     """Adaptive Conformal Inference (Gibbs & Candès 2021) run as one
     continuous online stream, with coverage aggregated per fold afterward.
@@ -144,7 +144,7 @@ def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
     union of all test blocks, in time order) the band uses the
     (1 - alpha_t) quantile of the trailing cal_window normalized scores;
     alpha_t is then updated by
-        alpha_{t+1} = alpha_t + gamma * (alpha - err_t),
+        alpha_{t+1} = alpha_t + gamma * (alpha - err_{t-delay}),
         err_t = 1[Y_t not covered].
     alpha_t carries across fold boundaries (true online behavior); it is
     NOT reset per fold. Coverage is then averaged within each fold.
@@ -154,6 +154,9 @@ def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
     resid, sigma : np.ndarray, shape (T,)   signed residuals and local scale.
     test_blocks : dict {fold:int -> np.ndarray of absolute test indices}.
     cal_window : int    trailing calibration length for each step's quantile.
+    delay : int         label maturity lag (h21 -> 21). At day t only indices
+                        s <= t-delay are visible; delay=0 reproduces the
+                        original (leaky) behavior for ablation.
     alpha : float       target miscoverage (nominal coverage = 1-alpha).
     gamma : float       ACI step size.
     a_lo, a_hi : float  clip bounds on alpha_t to keep the quantile finite.
@@ -172,14 +175,18 @@ def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
     covered_at = {}  # absolute index -> bool
 
     for t in all_test:
-        cal = score[t - cal_window:t]            # trailing window, excludes t
+        m = t - delay                            # newest index matured by day t
+        cal = score[m - cal_window:m]            # matured trailing window
         cal = cal[~np.isnan(cal)]
         q = np.quantile(cal, 1 - alpha_t)        # (1 - alpha_t) quantile
         covered = np.abs(resid[t]) <= q * sigma[t]
         covered_at[t] = bool(covered)
 
-        err = 0.0 if covered else 1.0
-        alpha_t = np.clip(alpha_t + gamma * (alpha - err), a_lo, a_hi)
+        # delayed feedback: only err_{t-delay} matures today; err_t is not
+        # observable until t+delay -- mirrors the stage-08 label_delay rule.
+        if m in covered_at:                      # first `delay` OOS days: no update
+            err = 0.0 if covered_at[m] else 1.0
+            alpha_t = np.clip(alpha_t + gamma * (alpha - err), a_lo, a_hi)
         alpha_path.append(alpha_t)
 
     fold_cov = {

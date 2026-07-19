@@ -67,7 +67,7 @@ def simulate_retrain(df, trigger_fn, train_window=1008, start=1008,
     test can verify the no-look-ahead invariant.
     """
     n = len(df)
-    beta = fit_har_frame(df.iloc[:start])   # initial model: static HAR on first `start` rows
+    beta = fit_har_frame(df.iloc[:start - label_delay])   # initial model: static HAR on first `start` rows
 
     matured = {}      # s -> QLIKE loss, present only once s + label_delay <= i
     pending = {}      # s -> (y_pred, y_true), waiting for the label to mature
