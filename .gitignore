@@ -8,5 +8,6 @@ __pycache__/
 .config/
 _git_ops.ipynb
 *_scratch.ipynb
+docs/*
 
 notebooks/00_env_check.ipynb

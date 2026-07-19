@@ -1,50 +1,52 @@
-"""
-uncertainty quantification for the HAR volatility forecaster.
+"""Uncertainty quantification for the HAR volatility forecaster (stage 07).
 
-All interval methods here wrap the SAME single-deployed HAR as Stage 06:
-OLS fit once on the first 1008 rows, then forward-predicted with NO retraining.
-Sharing one frozen model is what lets the 06 drift z-score and the 07 coverage
-gap be read on the same x/y axes (the "money plot").
+All interval methods here wrap the SAME model as stage 06: a static HAR
+fit once by OLS on the first 1008 rows and then used with no retraining.
+Sharing one static model is what makes the stage-06 drift z-scores and
+the stage-07 coverage gaps directly comparable per fold.
 
 Four interval families, in order of adaptivity:
-  1. split_conformal_coverage       — constant-width, distribution-free.
-  2. normalized_conformal_coverage  — width breathes with local sigma.
-  3. aci_stream_coverage            — online alpha_t update (Gibbs-Candes 2021).
-  4. bayes_nig_fit / _predict_interval — parametric Student-t (frozen contrast).
+  1. split_conformal_coverage       -- constant-width, distribution-free.
+  2. normalized_conformal_coverage  -- width scales with a local sigma.
+  3. aci_stream_coverage            -- online alpha_t update
+                                       (Adaptive Conformal Inference,
+                                       Gibbs & Candès 2021).
+  4. bayes_nig_fit / bayes_predict_interval -- parametric Student-t
+                                       intervals from a Normal-Inverse-
+                                       Gamma posterior, fit once.
 
-Thesis: under concept drift, exchangeability breaks and the frozen/constant-width
-methods (split, Bayesian) leak below nominal; only the online method (ACI) recovers
-long-run coverage.
+Working hypothesis being tested: under concept drift, exchangeability
+breaks, so the static-calibration methods (split conformal, Bayesian)
+under-cover, while the online method (ACI) recovers long-run coverage.
 """
 
 import numpy as np
 from scipy import stats
 
 
-def frozen_har_residuals(X, y, n_train=1008):
-    """
-    Reproduce Stage 06's single-deployed HAR and return signed residual stream.
+def static_har_residuals(X, y, n_train=1008):
+    """Reproduce stage 06's static HAR and return its residual stream.
 
-    Fit OLS ONCE on the first n_train rows (the '2011-15 frozen mapping'),
-    then forward-predict the entire series with NO retraining. The residual
-    stream therefore inherits the same drift that Stage 06 measured, so 06 and
-    07 describe one identical model.
+    Fit OLS once on the first n_train rows, then forward-predict the
+    entire series with no retraining. The residual stream therefore
+    shows the same drift that stage 06 measured -- stages 06 and 07
+    describe one identical model.
 
     Parameters
     ----------
-    X : np.ndarray, shape (T, p)   HAR design matrix (rv1, rv5, rv21), no intercept col.
+    X : np.ndarray, shape (T, p)   HAR features (rv1, rv5, rv21), no intercept column.
     y : np.ndarray, shape (T,)     target (future h-day RV).
-    n_train : int                  frozen-fit window (default 1008 = f00 test start anchor).
+    n_train : int                  training window (default 1008 = f00 test start).
 
     Returns
     -------
-    yhat : np.ndarray, shape (T,)  frozen-HAR point forecast over the full series.
-    resid : np.ndarray, shape (T,) signed residual y - yhat (raw, sign preserved).
+    yhat : np.ndarray, shape (T,)   static-HAR point forecast over the full series.
+    resid : np.ndarray, shape (T,)  signed residual y - yhat.
     beta : np.ndarray, shape (p+1,) fitted coefficients [intercept, b1, b5, b21].
     """
-    Xtr = np.column_stack([np.ones(n_train), X[:n_train]])  # add intercept
+    Xtr = np.column_stack([np.ones(n_train), X[:n_train]])
     ytr = y[:n_train]
-    # OLS closed form: beta = (X'X)^-1 X'y  (fit once, frozen thereafter)
+    # OLS normal equations: beta = (X'X)^-1 X'y, fit once
     beta = np.linalg.solve(Xtr.T @ Xtr, Xtr.T @ ytr)
 
     Xfull = np.column_stack([np.ones(len(X)), X])
@@ -54,16 +56,16 @@ def frozen_har_residuals(X, y, n_train=1008):
 
 
 def rolling_sigma(rv1, k=21):
-    """
-    Local scale estimate = trailing rolling std of rv1, shifted by 1.
+    """Local scale estimate: trailing rolling std of rv1, excluding today.
 
-    sigma_t uses only information up to t-1 (shift(1)) -> leakage-free,
-    preserving the exchangeability needed for normalized-conformal coverage.
+    sigma[t] is computed from rv1[t-k : t], i.e. information up to t-1
+    only, so it is leakage-free and can be used as a normalization
+    factor without breaking the conformal coverage guarantee.
 
     Parameters
     ----------
     rv1 : np.ndarray, shape (T,)   1-day realized vol series.
-    k : int                        rolling window (default 21 = HAR lookback / GARCH half-life).
+    k : int                        rolling window length (default 21 days).
 
     Returns
     -------
@@ -77,14 +79,15 @@ def rolling_sigma(rv1, k=21):
 
 
 def split_conformal_coverage(resid_cal, resid_test, alpha=0.1):
-    """
-    Split conformal with absolute-residual score (constant-width band).
+    """Split conformal prediction with absolute-residual score
+    (constant-width band).
 
-    Calibrate q on |resid_cal|, then measure realized coverage on test:
-    fraction of test points whose |resid| falls within the band half-width q.
+    Calibrate the band half-width q on |resid_cal|, then measure
+    realized coverage on the test residuals.
 
     score s_i = |resid_i|;  q = ceil((n+1)(1-alpha))-th smallest s_i.
-    Covered  <=>  |resid_test| <= q   (band is [yhat - q, yhat + q]).
+    A test point is covered iff |resid_test| <= q, i.e. the interval is
+    [yhat - q, yhat + q].
 
     Returns
     -------
@@ -95,7 +98,7 @@ def split_conformal_coverage(resid_cal, resid_test, alpha=0.1):
     s = np.abs(resid_cal)
     n = len(s)
     rank = int(np.ceil((n + 1) * (1 - alpha)))
-    if rank > n:                       # finite-sample edge: band = infinite
+    if rank > n:                       # finite-sample edge case: infinite band
         q = np.inf
     else:
         q = np.sort(s)[rank - 1]       # rank-th smallest (1-indexed)
@@ -105,19 +108,19 @@ def split_conformal_coverage(resid_cal, resid_test, alpha=0.1):
 
 def normalized_conformal_coverage(resid_cal, sigma_cal,
                                   resid_test, sigma_test, alpha=0.1):
-    """
-    Normalized (locally-adaptive) conformal: score scaled by local sigma.
+    """Normalized (locally adaptive) conformal: score scaled by local sigma.
 
     score s_i = |resid_i| / sigma_i;  q = ceil((n+1)(1-alpha))-th smallest s_i.
-    Band at test point = [yhat - q*sigma_test, yhat + q*sigma_test], so the
-    width breathes with local volatility. sigma must be leakage-free
-    (no calibration label) to preserve the coverage guarantee.
+    The interval at a test point is [yhat - q*sigma, yhat + q*sigma], so
+    the width tracks local volatility. sigma must be computed without
+    using the current label (see rolling_sigma) or the coverage
+    guarantee is lost.
 
     Returns
     -------
-    coverage : float        realized fraction covered on test.
-    q : float               calibrated quantile of normalized scores.
-    mean_width : float       average full band width = 2*q*mean(sigma_test).
+    coverage : float      realized fraction covered on test.
+    q : float             calibrated quantile of normalized scores.
+    mean_width : float    average full band width = 2*q*mean(sigma_test).
     """
     s = np.abs(resid_cal) / sigma_cal
     n = len(s)
@@ -134,16 +137,17 @@ def normalized_conformal_coverage(resid_cal, sigma_cal,
 
 def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
                         alpha=0.1, gamma=0.01, a_lo=1e-3, a_hi=1-1e-3):
-    """
-    Adaptive Conformal Inference (Gibbs & Candes 2021) run as one continuous
-    online stream, with coverage aggregated per fold afterward.
+    """Adaptive Conformal Inference (Gibbs & Candès 2021) run as one
+    continuous online stream, with coverage aggregated per fold afterward.
 
-    Normalized score s_i = |resid_i| / sigma_i. At each step t (over the union
-    of all test blocks, in time order) the band uses the (1 - alpha_t) quantile
-    of the trailing cal_window normalized scores; alpha_t is then updated by
-        alpha_{t+1} = alpha_t + gamma * (alpha - err_t),   err_t = 1[Y_t not covered].
-    alpha_t carries across fold boundaries (true online behavior); it is NOT
-    reset per fold. Coverage is then averaged within each fold's test indices.
+    Normalized score s_i = |resid_i| / sigma_i. At each step t (over the
+    union of all test blocks, in time order) the band uses the
+    (1 - alpha_t) quantile of the trailing cal_window normalized scores;
+    alpha_t is then updated by
+        alpha_{t+1} = alpha_t + gamma * (alpha - err_t),
+        err_t = 1[Y_t not covered].
+    alpha_t carries across fold boundaries (true online behavior); it is
+    NOT reset per fold. Coverage is then averaged within each fold.
 
     Parameters
     ----------
@@ -186,14 +190,17 @@ def aci_stream_coverage(resid, sigma, test_blocks, cal_window=252,
 
 
 def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
-    """
-    Fit a Normal-Inverse-Gamma posterior on calibration data (frozen once).
+    """Fit a Normal-Inverse-Gamma posterior on calibration data (fit once).
 
-    Conjugate to a Gaussian likelihood, so the posterior is analytic (NO MCMC).
-    Prior: beta | sigma^2 ~ N(0, sigma^2 (tau*I)^-1),  sigma^2 ~ Inv-Gamma(a0, b0).
-    Weakly-informative tau -> prior barely shrinks (posterior mean ~ OLS beta).
-    NOTE on scale: for tiny RV-scale targets, keep a0, b0 small (e.g. 1e-3, 1e-6),
-    else the prior dominates b_n/a_n and the intervals blow up to ~100% coverage.
+    Conjugate to a Gaussian likelihood, so the posterior is analytic (no
+    MCMC needed).
+    Prior: beta | sigma^2 ~ N(0, sigma^2 (tau*I)^-1),
+           sigma^2 ~ Inv-Gamma(a0, b0).
+    A small tau makes the prior weak, so the posterior mean is close to
+    the OLS estimate.
+    Note on scale: for tiny RV-scale targets keep a0, b0 small (e.g.
+    1e-3, 1e-6); otherwise the prior dominates b_n/a_n and the intervals
+    inflate toward ~100% coverage.
 
     Parameters
     ----------
@@ -205,10 +212,11 @@ def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
     Returns
     -------
     post : dict with
-        mu_n : (d,)   posterior mean of beta (ridge point estimate).
-        Lambda_n_inv : (d, d)  posterior precision inverse (epistemic scaffold).
-        a_n : float   posterior Inv-Gamma shape (predictive dof = 2*a_n).
-        b_n : float   posterior Inv-Gamma scale (aleatoric var = b_n/a_n).
+        mu_n : (d,)            posterior mean of beta (ridge-like point estimate).
+        Lambda_n_inv : (d, d)  inverse posterior precision (parameter covariance
+                               up to the sigma^2 factor).
+        a_n : float            posterior Inv-Gamma shape (predictive dof = 2*a_n).
+        b_n : float            posterior Inv-Gamma scale (noise variance = b_n/a_n).
     """
     X_cal = np.asarray(X_cal, float)
     y_cal = np.asarray(y_cal, float)
@@ -219,7 +227,7 @@ def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
 
     Lambda_n = X_cal.T @ X_cal + Lambda0                      # posterior precision
     Lambda_n_inv = np.linalg.inv(Lambda_n)
-    mu_n = Lambda_n_inv @ (X_cal.T @ y_cal + Lambda0 @ mu0)   # posterior mean (ridge point est)
+    mu_n = Lambda_n_inv @ (X_cal.T @ y_cal + Lambda0 @ mu0)   # posterior mean
 
     a_n = a0 + n / 2.0
     b_n = b0 + 0.5 * (
@@ -235,16 +243,15 @@ def bayes_nig_fit(X_cal, y_cal, tau=1e-3, a0=1.0, b0=1.0):
 
 
 def bayes_predict_interval(post, X_new, alpha=0.1):
-    """
-    Student-t posterior predictive interval for each row of X_new.
+    """Student-t posterior predictive interval for each row of X_new.
 
     Predictive: y* ~ t_nu( mean = x*'mu_n,
                            scale^2 = (b_n/a_n) * (1 + x*' Lambda_n_inv x*) ),
                 nu = 2*a_n.
-    scale^2 decomposes uncertainty into
-        aleatoric  = b_n / a_n                (frozen observation noise), and
-        epistemic  = x*' Lambda_n_inv x*      (parameter uncertainty; grows as
-                                               x* leaves the calibration region).
+    The scale decomposes into
+        aleatoric  = b_n / a_n            (observation noise, fixed at fit time),
+        epistemic  = x*' Lambda_n_inv x*  (parameter uncertainty; grows as x*
+                                           moves away from the calibration data).
 
     Parameters
     ----------

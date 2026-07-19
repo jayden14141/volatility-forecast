@@ -1,6 +1,15 @@
-# src/drift.py
-# Covariate-shift detection utilities: per-feature 2-sample tests.
-# Compares a reference window (train) against a test window for distribution shift.
+"""Drift detection utilities.
+
+Covariate-shift tests (ks_drift, psi) compare a reference window
+against a test window, one feature at a time. Concept-drift detectors
+(ddm, adwin) monitor a model's loss stream over time.
+
+References
+----------
+DDM   : Gama et al. (2004), "Learning with Drift Detection", SBIA.
+ADWIN : Bifet & Gavaldà (2007), "Learning from Time-Changing Data with
+        Adaptive Windowing", SIAM SDM.
+"""
 
 import numpy as np
 from scipy.stats import ks_2samp
@@ -61,7 +70,6 @@ def ddm(stream, warn_sigma=2.0, drift_sigma=3.0, min_n=100):
     floor (p_min + s_min) is breached by `*_sigma` standard deviations.
     Resets state after a drift (fresh concept).
     """
-    import numpy as np
     e = np.asarray(stream, dtype=float)
     n = len(e)
     p_min, s_min = np.inf, np.inf
@@ -88,7 +96,7 @@ def ddm(stream, warn_sigma=2.0, drift_sigma=3.0, min_n=100):
 
 
 def adwin(stream, delta=0.002, min_n=30):
-    """ADWIN (Bifet & Gavalda 2007), simple exact variant for a [0,1] stream.
+    """ADWIN (Bifet & Gavaldà 2007), simple exact variant for a [0,1] stream.
 
     Keeps an explicit window; after each new value, tries every split
     W = W0 . W1 and drops the stale prefix W0 when the sub-window means
@@ -98,7 +106,6 @@ def adwin(stream, delta=0.002, min_n=30):
     Exact O(n^2) worst case; fine up to a few thousand points. Production
     ADWIN uses exponential-histogram buckets for O(log n) memory/time.
     """
-    import numpy as np
     x = np.asarray(stream, dtype=float)
     n = len(x)
     window = []

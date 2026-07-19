@@ -1,50 +1,76 @@
+"""Retraining-policy simulator for the HAR volatility model (stage 08).
+
+The h=21 target for day s is realized volatility over days s+1..s+21,
+so the forecast error for day s can only be computed 21 trading days
+later. simulate_retrain() enforces this label delay: a retrain decision
+made at day i may only look at losses for days s <= i - LABEL_DELAY.
+Violating this would let the trigger react to information that does not
+exist yet (look-ahead bias) and invalidate every policy comparison.
+
+References
+----------
+ADWIN : Bifet & Gavaldà (2007), "Learning from Time-Changing Data with
+        Adaptive Windowing", SIAM SDM.
+QLIKE : Patton (2011), "Volatility forecast comparison using imperfect
+        volatility proxies", Journal of Econometrics.
+"""
+
 import numpy as np
 import pandas as pd
+
+from src.har import fit_har, predict_har
+from src.metrics import qlike
 
 FEATURES = ['rv1', 'rv5', 'rv21']
 TARGET = 'y_rv21'
 LABEL_DELAY = 21
 
 
-def fit_har(sub):
-    """OLS HAR on a slice with FEATURES + TARGET. Returns beta [b0, b_rv1, b_rv5, b_rv21]."""
-    X = np.column_stack([np.ones(len(sub))] + [sub[f].values for f in FEATURES])
-    y = sub[TARGET].values
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    return beta
+def fit_har_frame(frame):
+    """OLS HAR fit on a work-frame slice with FEATURES + TARGET columns.
+
+    Returns beta = [intercept, b_rv1, b_rv5, b_rv21].
+    """
+    return fit_har(frame[FEATURES].values, frame[TARGET].values)
 
 
-def predict_har(beta, row):
-    return beta[0] + beta[1] * row['rv1'] + beta[2] * row['rv5'] + beta[3] * row['rv21']
-
-
-def qlike(y_true, y_pred, eps=1e-12):
-    """QLIKE loss: y/yhat - ln(y/yhat) - 1. Positive-only (RV scale)."""
-    y_pred = max(float(y_pred), eps)
-    y_true = max(float(y_true), eps)
-    r = y_true / y_pred
-    return r - np.log(r) - 1.0
+def predict_har_row(beta, row):
+    """One-day HAR forecast from a single work-frame row."""
+    return predict_har(beta, [[row['rv1'], row['rv5'], row['rv21']]])[0]
 
 
 def simulate_retrain(df, trigger_fn, train_window=1008, start=1008,
                      label_delay=LABEL_DELAY, min_fit_rows=50):
-    """
-    Causal day-by-day retrain simulation.
+    """Simulate a retraining policy day by day, without look-ahead.
 
-    At OOS day tau (integer position i >= start):
-      1. reveal the loss L[i-label_delay] (it matures exactly today)
-      2. trigger_fn sees ONLY the revealed-loss buffer: {L[s] : s <= i-label_delay}
-      3. if fired, refit HAR on rolling window ending at last observable label (i-label_delay)
-      4. forecast y_pred[i] with current model; stash its loss as pending (matures at i+label_delay)
+    At each out-of-sample day i (integer position, i >= start):
+      1. The loss for day s = i - label_delay matures today and joins
+         the visible loss history.
+      2. trigger_fn decides whether to retrain. It only sees matured
+         losses (days s <= i - label_delay), never anything newer.
+      3. If it returns True, HAR is refit on the trailing train_window
+         rows ending at i - label_delay -- the newest row whose h=21
+         label is fully observed by day i.
+      4. The current model forecasts day i; that forecast's loss will
+         become visible at day i + label_delay.
 
-    Returns per-day log DataFrame; engine records newest visible loss index in .attrs
-    for a causality unit-test.
+    trigger_fn signature: (i, loss_history, visible_indices, df) -> bool
+      i               : integer position of the current day
+      loss_history    : np.ndarray of matured QLIKE losses, oldest first
+      visible_indices : row positions matching loss_history
+      df              : full work frame (features are observable same
+                        day; labels are NOT -- triggers must not read
+                        df[TARGET] at rows newer than i - label_delay)
+
+    Returns a per-day log DataFrame. .attrs['newest_visible'] records
+    the newest loss index the trigger could see each day, so a unit
+    test can verify the no-look-ahead invariant.
     """
     n = len(df)
-    beta = fit_har(df.iloc[:start])          # initial = frozen HAR on first `start` rows
+    beta = fit_har_frame(df.iloc[:start])   # initial model: static HAR on first `start` rows
 
-    revealed = {}     # s -> L[s], present only once s + label_delay <= i
-    pending = {}      # s -> (y_pred, y_true), awaiting maturity
+    matured = {}      # s -> QLIKE loss, present only once s + label_delay <= i
+    pending = {}      # s -> (y_pred, y_true), waiting for the label to mature
     log = []
     newest_visible = []
     n_retrains = 0
@@ -53,34 +79,35 @@ def simulate_retrain(df, trigger_fn, train_window=1008, start=1008,
     for i in range(start, n):
         row = df.iloc[i]
 
-        # (1) reveal the single loss maturing today
+        # (1) the single loss maturing today becomes visible
         s = i - label_delay
         if s >= start and s in pending:
             yp, yt = pending.pop(s)
-            revealed[s] = qlike(yt, yp)
+            matured[s] = qlike(yt, yp)
 
-        # (2) trigger sees revealed buffer (all keys <= i - label_delay by construction)
-        vis = sorted(revealed.keys())
-        newest_visible.append(vis[-1] if vis else -1)
-        loss_stream = np.array([revealed[k] for k in vis])
-        fire = bool(trigger_fn(i, loss_stream, vis, df))
+        # (2) trigger sees matured losses only (all keys <= i - label_delay)
+        visible_indices = sorted(matured.keys())
+        newest_visible.append(visible_indices[-1] if visible_indices else -1)
+        loss_history = np.array([matured[k] for k in visible_indices])
+        retrain_triggered = bool(trigger_fn(i, loss_history, visible_indices, df))
 
-        # (3) retrain on rolling window ending at last observable label
-        if fire:
+        # (3) refit on the trailing window ending at the last observable label
+        if retrain_triggered:
             end = i - label_delay
             begin = max(0, end - train_window)
             if end - begin >= min_fit_rows:
-                beta = fit_har(df.iloc[begin:end])
+                beta = fit_har_frame(df.iloc[begin:end])
                 n_retrains += 1
                 model_age = 0
 
-        # (4) forecast + stash pending loss
-        yp = predict_har(beta, row)
+        # (4) forecast today; loss stays pending until the label matures
+        yp = predict_har_row(beta, row)
         yt = row[TARGET]
         pending[i] = (yp, yt)
 
         log.append({'date': df.index[i], 'i': i, 'y_pred': yp, 'y_true': yt,
-                    'retrained': fire, 'n_retrains': n_retrains, 'model_age': model_age})
+                    'retrain_triggered': retrain_triggered,
+                    'n_retrains': n_retrains, 'model_age': model_age})
         model_age += 1
 
     out = pd.DataFrame(log).set_index('date')
@@ -90,10 +117,29 @@ def simulate_retrain(df, trigger_fn, train_window=1008, start=1008,
     out.attrs['label_delay'] = label_delay
     return out
 
+
 class AdwinStream:
-    """Streaming port of src/drift.py adwin -- identical math (Hoeffding cut,
-    delta/W correction), but stateful: one update(x) call per value, returns
-    True when a change is detected. reset() clears the window (post-retrain)."""
+    """Streaming ADWIN change detector (Bifet & Gavaldà 2007).
+
+    Same math as the batch adwin() in src/drift.py -- Hoeffding cut with
+    the delta/W correction -- but stateful: call update(x) once per new
+    value; it returns True when a change is detected. Call reset() after
+    acting on a detection (e.g. after retraining) so the window restarts
+    on the new regime.
+
+    The defaults reproduce the plain two-sided detector ("adwin_raw").
+    Three optional constraints make it a one-sided, minimum-evidence
+    variant ("adwin_directional"):
+      one_sided : only fire when the recent mean is HIGHER than the old
+                  mean (loss got worse; improvement is not a reason to
+                  retrain).
+      gap_min   : require at least this mean gap (effect size floor).
+      n1_min    : require at least this many points in the recent
+                  sub-window (don't fire on a handful of bad days).
+
+    This is the exact O(n^2)-worst-case variant with an explicit window;
+    production ADWIN uses exponential-histogram buckets for O(log n).
+    """
 
     def __init__(self, delta=0.002, min_n=30, one_sided=False, gap_min=0.0, n1_min=1):
         self.delta = delta
