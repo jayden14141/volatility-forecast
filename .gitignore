@@ -9,5 +9,6 @@ __pycache__/
 _git_ops.ipynb
 *_scratch.ipynb
 docs/*
+CLEANUP_REPORT.md
 
 notebooks/00_env_check.ipynb
