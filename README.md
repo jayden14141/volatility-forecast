@@ -44,7 +44,7 @@ tests use that effective sample size.
 
 One notebook per stage; each writes the file the next stage reads.
 
-1. `01_fetch_raw` — download 9 price/index series → `raw_close.csv`.
+1. `01_fetch_raw` — download 8 price/index series → `raw_close.csv`.
 2. `02_build_target` — features and forward RV targets → `dataset.csv`.
 3. `03_garch_baseline` — persistence, HAR, and a hand-rolled GARCH(1,1)
    checked against the `arch` package; fold-mean h21 RMSE 0.0049 (HAR).
